@@ -1,0 +1,597 @@
+import contextlib
+import csv
+import queue
+import time
+from datetime import datetime
+from typing import Any
+
+from bleak.backends.device import BLEDevice
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtWidgets import (
+    QComboBox,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app_config import COMMANDS
+from ble_worker import BleWorker
+from telemetry import (
+    TelemetryParser,
+    TelemetryState,
+    gps_status_from_sentence,
+    parse_pairs,
+)
+
+
+class DashboardWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("ESP32 BLE Telemetry")
+        self.resize(1180, 760)
+        self.setMinimumSize(980, 640)
+
+        self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.worker = BleWorker(self.events)
+        self.worker.start()
+        self.parser = TelemetryParser()
+        self.state = TelemetryState()
+        self.devices: list[BLEDevice] = []
+        self.field_labels: dict[str, QLabel] = {}
+        self.can_write = False
+        self.last_disconnect_message = ""
+        self.pending_command: tuple[str, float] | None = None
+
+        self._build_ui()
+        self._set_connected_controls(False)
+
+        self.event_timer = QTimer(self)
+        self.event_timer.timeout.connect(self._process_events)
+        self.event_timer.start(100)
+
+        self.elapsed_timer = QTimer(self)
+        self.elapsed_timer.timeout.connect(self._refresh_elapsed_time)
+        self.elapsed_timer.start(250)
+
+        self.command_timer = QTimer(self)
+        self.command_timer.timeout.connect(self._check_pending_command)
+        self.command_timer.start(500)
+
+    def _build_ui(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget {
+                background: #111315;
+                color: #f4f7fb;
+                font-family: Segoe UI;
+                font-size: 10pt;
+            }
+            QLabel#title {
+                font-size: 18pt;
+                font-weight: 600;
+            }
+            QLabel#status {
+                color: #9aa4b2;
+            }
+            QWidget[panel="true"] {
+                background: #191c1f;
+                border: 1px solid #2c3238;
+            }
+            QLabel[fieldLabel="true"] {
+                background: #191c1f;
+                color: #f4f7fb;
+            }
+            QLabel[fieldValue="true"] {
+                background: #191c1f;
+                color: #f4f7fb;
+                font-family: Cascadia Mono, Consolas, monospace;
+            }
+            QPushButton {
+                background: #20242a;
+                color: #f4f7fb;
+                border: 1px solid #8d949c;
+                padding: 8px 10px;
+            }
+            QPushButton:hover {
+                background: #2b3138;
+            }
+            QPushButton:disabled {
+                color: #68707a;
+                border-color: #3a4048;
+                background: #171a1e;
+            }
+            QPushButton#accent {
+                background: #3fb984;
+                color: #07130d;
+                border-color: #3fb984;
+                font-weight: 600;
+            }
+            QComboBox, QLineEdit, QTextEdit {
+                background: #0e1012;
+                color: #f4f7fb;
+                border: 1px solid #2c3238;
+                padding: 7px;
+                selection-background-color: #3fb984;
+                selection-color: #07130d;
+            }
+            QTextEdit {
+                font-family: Cascadia Mono, Consolas, monospace;
+            }
+            """
+        )
+
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        root = QVBoxLayout(central)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(14)
+
+        header = QHBoxLayout()
+        title = QLabel("ESP32 BLE Telemetry")
+        title.setObjectName("title")
+        self.status_label = QLabel("Disconnected")
+        self.status_label.setObjectName("status")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(title, 1)
+        header.addWidget(self.status_label, 1)
+        root.addLayout(header)
+
+        controls = self._panel()
+        controls_layout = QHBoxLayout(controls)
+        controls_layout.setContentsMargins(12, 12, 12, 12)
+        controls_layout.setSpacing(10)
+
+        self.scan_button = QPushButton("Scan")
+        self.scan_button.clicked.connect(self._scan)
+        self.device_combo = QComboBox()
+        self.device_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.connect_button = QPushButton("Connect")
+        self.connect_button.setObjectName("accent")
+        self.connect_button.clicked.connect(self._connect)
+        self.disconnect_button = QPushButton("Disconnect")
+        self.disconnect_button.clicked.connect(self._disconnect)
+
+        controls_layout.addWidget(self.scan_button)
+        controls_layout.addWidget(self.device_combo, 1)
+        controls_layout.addWidget(self.connect_button)
+        controls_layout.addWidget(self.disconnect_button)
+        root.addWidget(controls)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        root.addLayout(body, 1)
+
+        dashboard = self._panel()
+        dashboard_layout = QGridLayout(dashboard)
+        dashboard_layout.setContentsMargins(14, 14, 14, 14)
+        dashboard_layout.setHorizontalSpacing(20)
+        dashboard_layout.setVerticalSpacing(8)
+        body.addWidget(dashboard, 3)
+
+        fields = [
+            ("Connection", "connection"),
+            ("Last update time", "last_update_time"),
+            ("Seconds since last update", "seconds_since_last_update"),
+            ("CAN RX count", "can_rx_count"),
+            ("Last CAN ID", "last_can_id"),
+            ("Last CAN data", "last_can_data"),
+            ("GPS status", "gps_status"),
+            ("Latest GPS sentence", "latest_gps_sentence"),
+            ("IMU speed", "imu_speed"),
+            ("Temperature / pressure / humidity", "environment"),
+            ("SD card status", "sd_card_status"),
+            ("STM32 alive heartbeat", "stm32_alive"),
+            ("ESP32 alive heartbeat", "esp32_alive"),
+            ("Last response", "last_response"),
+        ]
+
+        for row, (label_text, key) in enumerate(fields):
+            label = QLabel(label_text)
+            label.setProperty("fieldLabel", True)
+            label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            value = QLabel("-")
+            value.setProperty("fieldValue", True)
+            value.setWordWrap(True)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            dashboard_layout.addWidget(label, row, 0)
+            dashboard_layout.addWidget(value, row, 1)
+            self.field_labels[key] = value
+
+        dashboard_layout.setColumnStretch(0, 0)
+        dashboard_layout.setColumnStretch(1, 1)
+
+        side = QVBoxLayout()
+        side.setSpacing(14)
+        body.addLayout(side, 2)
+
+        command_panel = self._panel()
+        command_layout = QVBoxLayout(command_panel)
+        command_layout.setContentsMargins(14, 14, 14, 14)
+        command_layout.setSpacing(10)
+        command_layout.addWidget(QLabel("Commands"))
+
+        command_grid = QGridLayout()
+        command_grid.setSpacing(10)
+        command_layout.addLayout(command_grid)
+
+        self.command_buttons: list[QPushButton] = []
+        for index, command in enumerate(COMMANDS):
+            button = QPushButton(command.label)
+            button.setToolTip(f"Sends: {command.payload}\n{command.description}")
+            button.clicked.connect(
+                lambda checked=False, selected=command.payload: self._send_command(selected)
+            )
+            command_grid.addWidget(button, index // 2, index % 2)
+            self.command_buttons.append(button)
+
+        rtc_button = QPushButton("SET_RTC,now")
+        rtc_button.clicked.connect(self._send_current_rtc)
+        command_grid.addWidget(rtc_button, (len(COMMANDS) + 1) // 2, 1)
+        self.command_buttons.append(rtc_button)
+
+        custom_layout = QHBoxLayout()
+        self.command_entry = QLineEdit()
+        self.command_entry.returnPressed.connect(self._send_custom_command)
+        self.send_button = QPushButton("Send")
+        self.send_button.clicked.connect(self._send_custom_command)
+        custom_layout.addWidget(self.command_entry, 1)
+        custom_layout.addWidget(self.send_button)
+        command_layout.addLayout(custom_layout)
+        side.addWidget(command_panel)
+
+        terminal = self._panel()
+        terminal_layout = QVBoxLayout(terminal)
+        terminal_layout.setContentsMargins(14, 14, 14, 14)
+        terminal_layout.setSpacing(10)
+        terminal_layout.addWidget(QLabel("Raw terminal"))
+        self.raw_text = QTextEdit()
+        self.raw_text.setReadOnly(True)
+        terminal_layout.addWidget(self.raw_text, 1)
+        side.addWidget(terminal, 1)
+
+    @staticmethod
+    def _panel() -> QWidget:
+        panel = QWidget()
+        panel.setProperty("panel", True)
+        return panel
+
+    def _scan(self) -> None:
+        self.scan_button.setEnabled(False)
+        self.status_label.setText("Scanning...")
+        self.worker.scan()
+
+    def _connect(self) -> None:
+        index = self.device_combo.currentIndex()
+        if index < 0 or index >= len(self.devices):
+            QMessageBox.warning(self, "No device selected", "Scan and select an ESP32 BLE device.")
+            return
+        self.connect_button.setEnabled(False)
+        self.status_label.setText("Connecting...")
+        self.worker.connect(self.devices[index])
+
+    def _disconnect(self) -> None:
+        self.worker.disconnect()
+
+    def _send_custom_command(self) -> None:
+        command = self.command_entry.text().strip()
+        if command:
+            self._send_command(command)
+            self.command_entry.clear()
+
+    def _send_current_rtc(self) -> None:
+        now = datetime.now().strftime("%Y-%m-%d,%H:%M:%S")
+        self._send_command(f"SET_RTC,{now}")
+
+    def _send_command(self, command: str) -> None:
+        self.worker.send(command)
+
+    def _process_events(self) -> None:
+        while True:
+            try:
+                event, payload = self.events.get_nowait()
+            except queue.Empty:
+                break
+
+            if event == "status":
+                self.status_label.setText(str(payload))
+            elif event == "devices":
+                self._set_devices(payload)
+            elif event == "connected":
+                self._handle_connected(payload)
+            elif event == "disconnected":
+                self._handle_disconnected(payload)
+            elif event == "data":
+                self._handle_data(payload)
+            elif event == "sent":
+                self._append_raw(f"> {payload} (BLE write complete)")
+                self.pending_command = (str(payload), time.monotonic())
+                self.state.last_response = f"write complete {payload}"
+                self._refresh_fields()
+            elif event == "log":
+                self._append_raw(str(payload))
+            elif event == "error":
+                self.status_label.setText(f"Error: {payload}")
+                self._append_raw(f"! {payload}")
+                self._set_connected_controls(self.state.connected)
+
+    def _set_devices(self, devices: list[BLEDevice]) -> None:
+        self.devices = devices
+        self.device_combo.clear()
+        for device in devices:
+            self.device_combo.addItem(f"{device.name or 'Unknown'} [{device.address}]")
+        if devices:
+            self.device_combo.setCurrentIndex(0)
+        self.scan_button.setEnabled(True)
+
+    def _handle_connected(self, payload: dict[str, Any]) -> None:
+        self.state.connected = True
+        self.can_write = bool(payload["can_write"])
+        self.last_disconnect_message = ""
+        self.state.device_name = f"{payload['name']} [{payload['address']}]"
+        self.status_label.setText(f"Connected to {self.state.device_name}")
+        self._append_raw(f"! connected to {self.state.device_name}")
+        if not payload["can_write"]:
+            self._append_raw("! no writable characteristic found; receive-only mode")
+        self._set_connected_controls(True)
+        self._refresh_fields()
+
+    def _handle_disconnected(self, payload: dict[str, Any] | None = None) -> None:
+        self.state.connected = False
+        self.can_write = False
+        self.pending_command = None
+        expected = bool(payload and payload.get("expected"))
+        self.status_label.setText("Disconnected" if expected else "Disconnected - reconnecting")
+        message = "! disconnected" if expected else "! disconnected unexpectedly"
+        if message != self.last_disconnect_message:
+            self._append_raw(message)
+            self.last_disconnect_message = message
+        self._set_connected_controls(False)
+        self._refresh_fields()
+
+    def _handle_data(self, payload: bytes) -> None:
+        lines = self.parser.feed(payload)
+        if not lines:
+            text = payload.decode("utf-8", errors="replace").strip()
+            if text:
+                lines = [text]
+                if text.startswith(("$LOG,", "TEL,")):
+                    self.parser.buffer = ""
+
+        for line in lines:
+            self._append_raw(line)
+            self._apply_line(line)
+
+        self._refresh_fields()
+
+    def _apply_line(self, line: str) -> None:
+        self.state.last_update_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.state.last_update_monotonic = time.monotonic()
+        self.state.last_response = line
+
+        parts = [part.strip() for part in line.split(",") if part.strip()]
+        if not parts:
+            return
+
+        message_type = parts[0].upper()
+        pairs = parse_pairs(parts[1:])
+
+        if message_type == "PONG":
+            value = pairs.get("esp32_ms") or pairs.get("ms") or "alive"
+            self.state.esp32_alive = value
+            self._clear_pending_command("PONG")
+            return
+
+        if message_type == "ACK":
+            self.state.last_response = line
+            self._clear_pending_command("ACK")
+            return
+
+        if message_type == "STATUS":
+            self._apply_status_pairs(pairs)
+            self._clear_pending_command("STATUS")
+            return
+
+        if message_type == "$LOG":
+            self._apply_log_line(line)
+            return
+
+        if message_type == "TEL":
+            self._apply_tel_pairs(pairs)
+            return
+
+        if message_type == "CAN":
+            self.state.can_rx_count += 1
+            self.state.last_can_id = pairs.get("id", pairs.get("can_id", self.state.last_can_id))
+            self.state.last_can_data = pairs.get("data", self.state.last_can_data)
+            return
+
+        if message_type == "GPS":
+            self.state.gps_status = pairs.get("status", pairs.get("gps", self.state.gps_status))
+            self.state.latest_gps_sentence = pairs.get(
+                "sentence", pairs.get("nmea", self.state.latest_gps_sentence)
+            )
+            return
+
+        if message_type == "IMU":
+            self.state.imu_speed = pairs.get(
+                "speed", pairs.get("imu_speed", self.state.imu_speed)
+            )
+            return
+
+        if message_type in {"ENV", "BME", "TEMP"}:
+            self._apply_environment_pairs(pairs)
+            return
+
+        if message_type == "SD":
+            self.state.sd_card_status = pairs.get("status", pairs.get("sd", line))
+            return
+
+        if message_type == "STM32":
+            self.state.stm32_alive = pairs.get("alive", pairs.get("ms", "alive"))
+            return
+
+        if message_type == "ESP32":
+            self.state.esp32_alive = pairs.get("alive", pairs.get("ms", "alive"))
+            return
+
+        self._apply_status_pairs(pairs)
+
+    def _clear_pending_command(self, response_type: str) -> None:
+        if self.pending_command is None:
+            return
+        command, _started_at = self.pending_command
+        self.pending_command = None
+        self._append_raw(f"! {response_type} received for last command: {command}")
+
+    def _check_pending_command(self) -> None:
+        if self.pending_command is None:
+            return
+        command, started_at = self.pending_command
+        if time.monotonic() - started_at < 3:
+            return
+        self.pending_command = None
+        self._append_raw(
+            f"! no ACK/STATUS/PONG within 3s for {command}; BLE write succeeded, firmware response was not seen"
+        )
+
+    def _apply_tel_pairs(self, pairs: dict[str, str]) -> None:
+        if "seq" in pairs:
+            self.state.esp32_alive = f"seq {pairs['seq']}"
+        if "age_ms" in pairs:
+            self.state.stm32_alive = f"age {pairs['age_ms']} ms"
+        if "speed" in pairs:
+            self.state.imu_speed = pairs["speed"]
+        if "temp" in pairs:
+            self.state.temperature = pairs["temp"]
+        if "temperature" in pairs:
+            self.state.temperature = pairs["temperature"]
+        if "pressure" in pairs:
+            self.state.pressure = pairs["pressure"]
+        if "humidity" in pairs:
+            self.state.humidity = pairs["humidity"]
+        if "can" in pairs:
+            self.state.last_can_data = f"CAN {pairs['can']}"
+            with contextlib.suppress(ValueError):
+                self.state.can_rx_count = int(pairs["can"])
+        if "can_id" in pairs:
+            self.state.last_can_id = pairs["can_id"]
+        if "gps" in pairs:
+            self.state.gps_status = pairs["gps"]
+        if "gps_status" in pairs:
+            self.state.gps_status = pairs["gps_status"]
+        if "gps_sentence" in pairs:
+            self.state.latest_gps_sentence = pairs["gps_sentence"]
+        if "raw_len" in pairs:
+            self.state.last_can_data = (
+                f"{self.state.last_can_data} raw_len={pairs['raw_len']}"
+            )
+
+    def _apply_log_line(self, line: str) -> None:
+        try:
+            fields = next(csv.reader([line]))
+        except csv.Error:
+            return
+
+        if len(fields) < 23:
+            return
+
+        self.state.esp32_alive = fields[2]
+        self.state.stm32_alive = "OK" if fields[4] == "1" else fields[4]
+        self.state.esp32_alive = "OK" if fields[6] == "1" else self.state.esp32_alive
+
+        with contextlib.suppress(ValueError):
+            self.state.can_rx_count = int(fields[8])
+
+        self.state.imu_speed = fields[13]
+        self.state.temperature = fields[14]
+        self.state.pressure = fields[15]
+        self.state.humidity = fields[16]
+        self.state.sd_card_status = "OK" if fields[17] == "0" else fields[17]
+        self.state.last_can_id = fields[18]
+        self.state.last_can_data = f"{fields[19]},{fields[20]}"
+        self.state.latest_gps_sentence = fields[22]
+        self.state.gps_status = gps_status_from_sentence(fields[22])
+
+    def _apply_status_pairs(self, pairs: dict[str, str]) -> None:
+        if "stm32" in pairs:
+            self.state.stm32_alive = pairs["stm32"]
+        if "esp32" in pairs:
+            self.state.esp32_alive = pairs["esp32"]
+        if "can" in pairs:
+            self.state.last_can_data = f"CAN {pairs['can']}"
+        if "sd" in pairs:
+            self.state.sd_card_status = pairs["sd"]
+        if "gps" in pairs:
+            self.state.gps_status = pairs["gps"]
+        self._apply_environment_pairs(pairs)
+
+    def _apply_environment_pairs(self, pairs: dict[str, str]) -> None:
+        if "temp" in pairs:
+            self.state.temperature = pairs["temp"]
+        if "temperature" in pairs:
+            self.state.temperature = pairs["temperature"]
+        if "pressure" in pairs:
+            self.state.pressure = pairs["pressure"]
+        if "humidity" in pairs:
+            self.state.humidity = pairs["humidity"]
+
+    def _refresh_fields(self) -> None:
+        connection = "Connected" if self.state.connected else "Disconnected"
+        if self.state.connected:
+            connection = f"{connection} - {self.state.device_name}"
+
+        environment = (
+            f"{self.state.temperature} / {self.state.pressure} / {self.state.humidity}"
+        )
+
+        values = {
+            "connection": connection,
+            "last_update_time": self.state.last_update_time,
+            "seconds_since_last_update": self.state.seconds_since_last_update,
+            "can_rx_count": str(self.state.can_rx_count),
+            "last_can_id": self.state.last_can_id,
+            "last_can_data": self.state.last_can_data,
+            "gps_status": self.state.gps_status,
+            "latest_gps_sentence": self.state.latest_gps_sentence,
+            "imu_speed": self.state.imu_speed,
+            "environment": environment,
+            "sd_card_status": self.state.sd_card_status,
+            "stm32_alive": self.state.stm32_alive,
+            "esp32_alive": self.state.esp32_alive,
+            "last_response": self.state.last_response,
+        }
+
+        for key, value in values.items():
+            self.field_labels[key].setText(value)
+
+    def _refresh_elapsed_time(self) -> None:
+        self.field_labels["seconds_since_last_update"].setText(
+            self.state.seconds_since_last_update
+        )
+
+    def _append_raw(self, line: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.raw_text.append(f"[{timestamp}] {line}")
+
+    def _set_connected_controls(self, connected: bool) -> None:
+        self.scan_button.setEnabled(not connected)
+        self.connect_button.setEnabled(not connected)
+        self.disconnect_button.setEnabled(connected)
+        command_enabled = connected and self.can_write
+        self.command_entry.setEnabled(command_enabled)
+        self.send_button.setEnabled(command_enabled)
+        for button in self.command_buttons:
+            button.setEnabled(command_enabled)
+
+    def closeEvent(self, event: Any) -> None:
+        self.worker.shutdown()
+        event.accept()
