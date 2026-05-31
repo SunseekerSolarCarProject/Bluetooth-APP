@@ -21,7 +21,7 @@ class CommandSpec:
 
 
 COMMANDS = [
-    CommandSpec("GET_STATUS", "GET_STATUS", "Request current ESP32/STM32 status."),
+    CommandSpec("GET_STATUS", "GET_STATUS", "Request current ESP32 telemetry status."),
     CommandSpec("SET_RATE,1000", "SET_RATE,1000", "Set telemetry rate to 1000 ms."),
     CommandSpec("SET_RATE,500", "SET_RATE,500", "Set telemetry rate to 500 ms."),
     CommandSpec("SET_MODE,RAW", "SET_MODE,RAW", "Send full $LOG rows."),

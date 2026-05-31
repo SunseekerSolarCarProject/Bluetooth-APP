@@ -15,9 +15,9 @@ Simple PyQt6 desktop dashboard for receiving telemetry from an ESP32 BLE device 
   - IMU speed
   - temperature, pressure, humidity
   - SD card status
-  - STM32/ESP32 heartbeat
+  - telemetry source freshness and ESP32 sequence/status
 - Show raw BLE terminal output.
-- Send firmware commands such as `PING`, `GET_STATUS`, `SET_MODE,COMPACT`, and `FIELDS,STCG`.
+- Send firmware commands such as `PING`, `GET_STATUS`, `SET_MODE,COMPACT`, `FIELDS,STCG`, and `SET_RTC,now`.
 - Automatically reconnect after unexpected BLE disconnects.
 
 ## Requirements
@@ -76,8 +76,10 @@ TEL,v=1,seq=2189,age_ms=12,raw_len=180,speed=0.00,temp=23.72,can=0,gps=NO_FIX
 Raw log telemetry:
 
 ```text
-$LOG,...
+$LOG,354,360745,"2026-05-16 17:56:44",1,955,256,164,0,-61,-183,0.00,22.00,98643.80,50.04,0,0x000,0,0,"","$GNGGA..."
 ```
+
+The current raw log format uses one firmware timestamp. Older two-timestamp `$LOG` rows are still parsed as a compatibility fallback.
 
 ## Commands
 
@@ -94,7 +96,14 @@ PING
 START_LOG
 STOP_LOG
 CALIBRATE_IMU
+SET_RTC
 CLEAR_ERRORS
+```
+
+The `SET_RTC,now` button sends the desktop's current local time. The `SET_RTC,selected` control sends the date/time chosen in the app. Both use:
+
+```text
+SET_RTC,YYYY-MM-DD,HH:MM:SS
 ```
 
 Field aliases for `FIELDS,STCG`:

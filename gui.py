@@ -6,9 +6,10 @@ from datetime import datetime
 from typing import Any
 
 from bleak.backends.device import BLEDevice
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QDateTime, QTimer, Qt
 from PyQt6.QtWidgets import (
     QComboBox,
+    QDateTimeEdit,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -189,8 +190,8 @@ class DashboardWindow(QMainWindow):
             ("IMU speed", "imu_speed"),
             ("Temperature / pressure / humidity", "environment"),
             ("SD card status", "sd_card_status"),
-            ("STM32 alive heartbeat", "stm32_alive"),
-            ("ESP32 alive heartbeat", "esp32_alive"),
+            ("Telemetry source / age", "stm32_alive"),
+            ("ESP32 sequence / status", "esp32_alive"),
             ("Last response", "last_response"),
         ]
 
@@ -233,10 +234,26 @@ class DashboardWindow(QMainWindow):
             command_grid.addWidget(button, index // 2, index % 2)
             self.command_buttons.append(button)
 
+        rtc_index = len(COMMANDS)
         rtc_button = QPushButton("SET_RTC,now")
+        rtc_button.setToolTip("Sends the current local desktop time to the device RTC.")
         rtc_button.clicked.connect(self._send_current_rtc)
-        command_grid.addWidget(rtc_button, (len(COMMANDS) + 1) // 2, 1)
+        command_grid.addWidget(rtc_button, rtc_index // 2, rtc_index % 2)
         self.command_buttons.append(rtc_button)
+
+        rtc_layout = QHBoxLayout()
+        self.rtc_datetime = QDateTimeEdit()
+        self.rtc_datetime.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.rtc_datetime.setCalendarPopup(True)
+        self.rtc_datetime.setDateTime(QDateTime.currentDateTime())
+        self.rtc_datetime.setToolTip("Select a custom local date/time to send to the device RTC.")
+        self.rtc_button = QPushButton("SET_RTC,selected")
+        self.rtc_button.setToolTip("Sends the selected local date/time to the device RTC.")
+        self.rtc_button.clicked.connect(self._send_selected_rtc)
+        rtc_layout.addWidget(self.rtc_datetime, 1)
+        rtc_layout.addWidget(self.rtc_button)
+        command_layout.addLayout(rtc_layout)
+        self.command_buttons.append(self.rtc_button)
 
         custom_layout = QHBoxLayout()
         self.command_entry = QLineEdit()
@@ -290,6 +307,11 @@ class DashboardWindow(QMainWindow):
     def _send_current_rtc(self) -> None:
         now = datetime.now().strftime("%Y-%m-%d,%H:%M:%S")
         self._send_command(f"SET_RTC,{now}")
+
+    def _send_selected_rtc(self) -> None:
+        selected = self.rtc_datetime.dateTime().toPyDateTime()
+        timestamp = selected.strftime("%Y-%m-%d,%H:%M:%S")
+        self._send_command(f"SET_RTC,{timestamp}")
 
     def _send_command(self, command: str) -> None:
         self.worker.send(command)
@@ -360,11 +382,7 @@ class DashboardWindow(QMainWindow):
     def _handle_data(self, payload: bytes) -> None:
         lines = self.parser.feed(payload)
         if not lines:
-            text = payload.decode("utf-8", errors="replace").strip()
-            if text:
-                lines = [text]
-                if text.startswith(("$LOG,", "TEL,")):
-                    self.parser.buffer = ""
+            return
 
         for line in lines:
             self._append_raw(line)
@@ -468,6 +486,11 @@ class DashboardWindow(QMainWindow):
             self.state.esp32_alive = f"seq {pairs['seq']}"
         if "age_ms" in pairs:
             self.state.stm32_alive = f"age {pairs['age_ms']} ms"
+
+        if self._apply_shifted_compact_fields(pairs):
+            self._apply_tel_status_pairs(pairs)
+            return
+
         if "speed" in pairs:
             self.state.imu_speed = pairs["speed"]
         if "temp" in pairs:
@@ -495,16 +518,71 @@ class DashboardWindow(QMainWindow):
                 f"{self.state.last_can_data} raw_len={pairs['raw_len']}"
             )
 
+    def _apply_shifted_compact_fields(self, pairs: dict[str, str]) -> bool:
+        speed = self._parse_float(pairs.get("speed"))
+        compact_temp = self._parse_float(pairs.get("temp") or pairs.get("temperature"))
+        if speed is None or compact_temp is None:
+            return False
+
+        if not (30000 <= speed <= 120000 and 0 <= compact_temp <= 100):
+            return False
+
+        self.state.pressure = pairs["speed"]
+        self.state.humidity = pairs.get("temp", pairs.get("temperature", self.state.humidity))
+        if self.state.temperature in {"-", self.state.humidity}:
+            self.state.temperature = "-"
+        if self.state.imu_speed == pairs["speed"]:
+            self.state.imu_speed = "-"
+        return True
+
+    def _apply_tel_status_pairs(self, pairs: dict[str, str]) -> None:
+        if "can" in pairs:
+            self.state.last_can_data = f"CAN {pairs['can']}"
+            with contextlib.suppress(ValueError):
+                self.state.can_rx_count = int(pairs["can"])
+        if "can_id" in pairs:
+            self.state.last_can_id = pairs["can_id"]
+        if "gps" in pairs:
+            self.state.gps_status = pairs["gps"]
+        if "gps_status" in pairs:
+            self.state.gps_status = pairs["gps_status"]
+        if "gps_sentence" in pairs:
+            self.state.latest_gps_sentence = pairs["gps_sentence"]
+        if "raw_len" in pairs:
+            self.state.last_can_data = (
+                f"{self.state.last_can_data} raw_len={pairs['raw_len']}"
+            )
+
     def _apply_log_line(self, line: str) -> None:
         try:
             fields = next(csv.reader([line]))
         except csv.Error:
             return
 
-        if len(fields) < 23:
+        if len(fields) >= 23:
+            self._apply_legacy_log_fields(fields)
             return
 
-        self.state.esp32_alive = fields[2]
+        if len(fields) >= 21:
+            self._apply_current_log_fields(fields)
+            return
+
+    def _apply_current_log_fields(self, fields: list[str]) -> None:
+        self.state.esp32_alive = f"seq {fields[1]} uptime {fields[2]} ms"
+        self.state.stm32_alive = "OK" if fields[4] == "1" else fields[4]
+
+        self.state.imu_speed = fields[11]
+        self.state.temperature = fields[12]
+        self.state.pressure = fields[13]
+        self.state.humidity = fields[14]
+        self.state.sd_card_status = self._format_sd_status(fields[15])
+        self.state.last_can_id = fields[16]
+        self.state.last_can_data = f"{fields[17]},{fields[18]}"
+        self.state.latest_gps_sentence = fields[20]
+        self.state.gps_status = gps_status_from_sentence(fields[20])
+
+    def _apply_legacy_log_fields(self, fields: list[str]) -> None:
+        self.state.esp32_alive = f"uptime {fields[2]} ms"
         self.state.stm32_alive = "OK" if fields[4] == "1" else fields[4]
         self.state.esp32_alive = "OK" if fields[6] == "1" else self.state.esp32_alive
 
@@ -515,17 +593,35 @@ class DashboardWindow(QMainWindow):
         self.state.temperature = fields[14]
         self.state.pressure = fields[15]
         self.state.humidity = fields[16]
-        self.state.sd_card_status = "OK" if fields[17] == "0" else fields[17]
+        self.state.sd_card_status = self._format_sd_status(fields[17])
         self.state.last_can_id = fields[18]
         self.state.last_can_data = f"{fields[19]},{fields[20]}"
         self.state.latest_gps_sentence = fields[22]
         self.state.gps_status = gps_status_from_sentence(fields[22])
 
     def _apply_status_pairs(self, pairs: dict[str, str]) -> None:
-        if "stm32" in pairs:
-            self.state.stm32_alive = pairs["stm32"]
-        if "esp32" in pairs:
-            self.state.esp32_alive = pairs["esp32"]
+        source_parts: list[str] = []
+        for key, label in (("stm32", "src"), ("spi_task", "spi"), ("age_ms", "age")):
+            if key in pairs:
+                value = f"{pairs[key]} ms" if key == "age_ms" else pairs[key]
+                source_parts.append(f"{label}={value}")
+        if source_parts:
+            self.state.stm32_alive = " ".join(source_parts)
+
+        esp32_parts: list[str] = []
+        for key, label in (
+            ("esp32", "esp32"),
+            ("ble", "ble"),
+            ("seq", "seq"),
+            ("mode", "mode"),
+            ("rate_ms", "rate"),
+        ):
+            if key in pairs:
+                value = f"{pairs[key]} ms" if key == "rate_ms" else pairs[key]
+                esp32_parts.append(f"{label}={value}")
+        if esp32_parts:
+            self.state.esp32_alive = " ".join(esp32_parts)
+
         if "can" in pairs:
             self.state.last_can_data = f"CAN {pairs['can']}"
         if "sd" in pairs:
@@ -533,6 +629,18 @@ class DashboardWindow(QMainWindow):
         if "gps" in pairs:
             self.state.gps_status = pairs["gps"]
         self._apply_environment_pairs(pairs)
+
+    @staticmethod
+    def _format_sd_status(value: str) -> str:
+        return "OK" if value == "0" else value
+
+    @staticmethod
+    def _parse_float(value: str | None) -> float | None:
+        if value is None:
+            return None
+        with contextlib.suppress(ValueError):
+            return float(value)
+        return None
 
     def _apply_environment_pairs(self, pairs: dict[str, str]) -> None:
         if "temp" in pairs:
@@ -589,6 +697,7 @@ class DashboardWindow(QMainWindow):
         command_enabled = connected and self.can_write
         self.command_entry.setEnabled(command_enabled)
         self.send_button.setEnabled(command_enabled)
+        self.rtc_datetime.setEnabled(command_enabled)
         for button in self.command_buttons:
             button.setEnabled(command_enabled)
 
