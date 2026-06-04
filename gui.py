@@ -2,6 +2,7 @@ import contextlib
 import csv
 import queue
 import time
+from collections import deque
 from datetime import datetime
 from typing import Any
 
@@ -33,6 +34,9 @@ from telemetry import (
 )
 
 
+RAW_TERMINAL_RETENTION_SECONDS = 5 * 60
+
+
 class DashboardWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -50,6 +54,7 @@ class DashboardWindow(QMainWindow):
         self.can_write = False
         self.last_disconnect_message = ""
         self.pending_command: tuple[str, float] | None = None
+        self.raw_entries: deque[tuple[float, str]] = deque()
 
         self._build_ui()
         self._set_connected_controls(False)
@@ -687,8 +692,18 @@ class DashboardWindow(QMainWindow):
         )
 
     def _append_raw(self, line: str) -> None:
+        now = time.monotonic()
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.raw_text.append(f"[{timestamp}] {line}")
+        self.raw_entries.append((now, f"[{timestamp}] {line}"))
+        self._prune_raw_entries(now)
+        self.raw_text.setPlainText("\n".join(entry for _created_at, entry in self.raw_entries))
+        scrollbar = self.raw_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _prune_raw_entries(self, now: float) -> None:
+        cutoff = now - RAW_TERMINAL_RETENTION_SECONDS
+        while self.raw_entries and self.raw_entries[0][0] < cutoff:
+            self.raw_entries.popleft()
 
     def _set_connected_controls(self, connected: bool) -> None:
         self.scan_button.setEnabled(not connected)

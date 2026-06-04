@@ -16,7 +16,7 @@ Simple PyQt6 desktop dashboard for receiving telemetry from an ESP32 BLE device 
   - temperature, pressure, humidity
   - SD card status
   - telemetry source freshness and ESP32 sequence/status
-- Show raw BLE terminal output.
+- Show a rolling five-minute raw BLE terminal output.
 - Send firmware commands such as `PING`, `GET_STATUS`, `SET_MODE,COMPACT`, `FIELDS,STCG`, and `SET_RTC,now`.
 - Automatically reconnect after unexpected BLE disconnects.
 
