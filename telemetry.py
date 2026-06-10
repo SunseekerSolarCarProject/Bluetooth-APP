@@ -13,6 +13,7 @@ class TelemetryState:
     last_can_id: str = "-"
     last_can_data: str = "-"
     gps_status: str = "-"
+    gps_speed: str = "-"
     latest_gps_sentence: str = "-"
     imu_speed: str = "-"
     temperature: str = "-"

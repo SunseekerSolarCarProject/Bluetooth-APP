@@ -191,8 +191,9 @@ class DashboardWindow(QMainWindow):
             ("Last CAN ID", "last_can_id"),
             ("Last CAN data", "last_can_data"),
             ("GPS status", "gps_status"),
+            ("GPS speed", "gps_speed"),
             ("Latest GPS sentence", "latest_gps_sentence"),
-            ("IMU speed", "imu_speed"),
+            ("Speed", "imu_speed"),
             ("Temperature / pressure / humidity", "environment"),
             ("SD card status", "sd_card_status"),
             ("Telemetry source / age", "stm32_alive"),
@@ -439,6 +440,9 @@ class DashboardWindow(QMainWindow):
 
         if message_type == "GPS":
             self.state.gps_status = pairs.get("status", pairs.get("gps", self.state.gps_status))
+            for key in ("gps_speed", "gps_speed_kph", "gps_kph", "speed"):
+                if key in pairs:
+                    self.state.gps_speed = pairs[key]
             self.state.latest_gps_sentence = pairs.get(
                 "sentence", pairs.get("nmea", self.state.latest_gps_sentence)
             )
@@ -516,6 +520,9 @@ class DashboardWindow(QMainWindow):
             self.state.gps_status = pairs["gps"]
         if "gps_status" in pairs:
             self.state.gps_status = pairs["gps_status"]
+        for key in ("gps_speed", "gps_speed_kph", "gps_kph"):
+            if key in pairs:
+                self.state.gps_speed = pairs[key]
         if "gps_sentence" in pairs:
             self.state.latest_gps_sentence = pairs["gps_sentence"]
         if "raw_len" in pairs:
@@ -551,6 +558,9 @@ class DashboardWindow(QMainWindow):
             self.state.gps_status = pairs["gps"]
         if "gps_status" in pairs:
             self.state.gps_status = pairs["gps_status"]
+        for key in ("gps_speed", "gps_speed_kph", "gps_kph"):
+            if key in pairs:
+                self.state.gps_speed = pairs[key]
         if "gps_sentence" in pairs:
             self.state.latest_gps_sentence = pairs["gps_sentence"]
         if "raw_len" in pairs:
@@ -562,6 +572,10 @@ class DashboardWindow(QMainWindow):
         try:
             fields = next(csv.reader([line]))
         except csv.Error:
+            return
+
+        if self._is_extended_current_log_fields(fields):
+            self._apply_extended_current_log_fields(fields)
             return
 
         if len(fields) >= 23:
@@ -585,6 +599,30 @@ class DashboardWindow(QMainWindow):
         self.state.last_can_data = f"{fields[17]},{fields[18]}"
         self.state.latest_gps_sentence = fields[20]
         self.state.gps_status = gps_status_from_sentence(fields[20])
+
+    def _apply_extended_current_log_fields(self, fields: list[str]) -> None:
+        self.state.esp32_alive = f"seq {fields[1]} uptime {fields[2]} ms"
+        self.state.stm32_alive = "OK" if fields[4] == "1" else fields[4]
+
+        self.state.imu_speed = fields[11]
+        self.state.gps_speed = fields[12]
+        self.state.temperature = fields[16]
+        self.state.pressure = fields[17]
+        self.state.humidity = fields[18]
+        self.state.sd_card_status = self._format_sd_status(fields[19])
+        self.state.last_can_id = fields[20]
+        self.state.last_can_data = f"{fields[21]},{fields[22]}"
+        if fields[23]:
+            self.state.last_can_data = f"{self.state.last_can_data},{fields[23]}"
+        self.state.latest_gps_sentence = fields[24]
+
+        sentence_status = gps_status_from_sentence(fields[24])
+        gps_block_status = fields[15]
+        self.state.gps_status = (
+            sentence_status
+            if sentence_status != "-"
+            else ("-" if gps_block_status in {"", "NONE"} else gps_block_status)
+        )
 
     def _apply_legacy_log_fields(self, fields: list[str]) -> None:
         self.state.esp32_alive = f"uptime {fields[2]} ms"
@@ -633,6 +671,9 @@ class DashboardWindow(QMainWindow):
             self.state.sd_card_status = pairs["sd"]
         if "gps" in pairs:
             self.state.gps_status = pairs["gps"]
+        for key in ("gps_speed", "gps_speed_kph", "gps_kph"):
+            if key in pairs:
+                self.state.gps_speed = pairs[key]
         self._apply_environment_pairs(pairs)
 
     @staticmethod
@@ -646,6 +687,17 @@ class DashboardWindow(QMainWindow):
         with contextlib.suppress(ValueError):
             return float(value)
         return None
+
+    @staticmethod
+    def _is_extended_current_log_fields(fields: list[str]) -> bool:
+        if len(fields) < 25:
+            return False
+        return (
+            DashboardWindow._parse_float(fields[5]) is not None
+            and DashboardWindow._parse_float(fields[16]) is not None
+            and DashboardWindow._parse_float(fields[17]) is not None
+            and DashboardWindow._parse_float(fields[18]) is not None
+        )
 
     def _apply_environment_pairs(self, pairs: dict[str, str]) -> None:
         if "temp" in pairs:
@@ -674,6 +726,7 @@ class DashboardWindow(QMainWindow):
             "last_can_id": self.state.last_can_id,
             "last_can_data": self.state.last_can_data,
             "gps_status": self.state.gps_status,
+            "gps_speed": self.state.gps_speed,
             "latest_gps_sentence": self.state.latest_gps_sentence,
             "imu_speed": self.state.imu_speed,
             "environment": environment,
