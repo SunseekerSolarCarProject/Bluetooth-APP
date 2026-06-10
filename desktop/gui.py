@@ -24,9 +24,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app_config import COMMANDS
-from ble_worker import BleWorker
-from telemetry import (
+from desktop.ble_worker import BleWorker
+from shared.app_config import COMMANDS
+from shared.telemetry import (
     TelemetryParser,
     TelemetryState,
     gps_status_from_sentence,

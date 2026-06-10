@@ -9,7 +9,7 @@ from bleak import BleakClient, BleakScanner
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 
-from app_config import (
+from shared.app_config import (
     BLUETOOTH_SIG_SUFFIX,
     BLE_COMMAND_CHUNK_SIZE,
     COMMON_SERIAL_UUIDS,

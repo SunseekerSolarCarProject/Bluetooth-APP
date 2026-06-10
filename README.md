@@ -38,6 +38,12 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
+You can also run the desktop package directly:
+
+```powershell
+python -m desktop.main
+```
+
 Then:
 
 1. Click `Scan`.
@@ -121,12 +127,23 @@ A = all fields
 
 ## Project Files
 
-- `main.py` - application entry point
-- `gui.py` - PyQt6 user interface
-- `ble_worker.py` - BLE scan/connect/read/write logic
-- `telemetry.py` - telemetry parsing and state
-- `app_config.py` - UUIDs and command definitions
+- `main.py` - root launcher for the desktop app
+- `desktop/main.py` - desktop application entry point
+- `desktop/gui.py` - PyQt6 user interface
+- `desktop/ble_worker.py` - desktop BLE scan/connect/read/write logic
+- `shared/telemetry.py` - telemetry parsing and state
+- `shared/app_config.py` - UUIDs and command definitions
+- `android/` - native Kotlin Android app scaffold for phone BLE testing
 - `requirements.txt` - Python dependencies
+
+## Android App
+
+The `android/` folder contains a native Kotlin Android Studio project. It is
+intended to use Android's BLE APIs directly while following the same ESP32
+telemetry protocol as the desktop app.
+
+Open `android/` in Android Studio, sync Gradle, then run the `app`
+configuration on a BLE-capable Android phone.
 
 ## License
 
