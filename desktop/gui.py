@@ -574,6 +574,10 @@ class DashboardWindow(QMainWindow):
         except csv.Error:
             return
 
+        if self._is_full_current_log_fields(fields):
+            self._apply_full_current_log_fields(fields)
+            return
+
         if self._is_extended_current_log_fields(fields):
             self._apply_extended_current_log_fields(fields)
             return
@@ -599,6 +603,28 @@ class DashboardWindow(QMainWindow):
         self.state.last_can_data = f"{fields[17]},{fields[18]}"
         self.state.latest_gps_sentence = fields[20]
         self.state.gps_status = gps_status_from_sentence(fields[20])
+
+    def _apply_full_current_log_fields(self, fields: list[str]) -> None:
+        self.state.esp32_alive = f"seq {fields[1]} uptime {fields[2]} ms"
+        self.state.stm32_alive = "OK" if fields[4] == "1" else fields[4]
+
+        self.state.imu_speed = fields[11]
+        self.state.gps_speed = fields[12]
+        self.state.temperature = fields[23]
+        self.state.pressure = fields[24]
+        self.state.humidity = fields[25]
+        self.state.sd_card_status = self._format_sd_status(fields[26])
+        self.state.last_can_id = fields[27]
+        self.state.last_can_data = f"{fields[28]},{fields[29]}"
+        self.state.latest_gps_sentence = fields[30]
+
+        sentence_status = gps_status_from_sentence(fields[30])
+        gps_block_status = fields[16]
+        self.state.gps_status = (
+            sentence_status
+            if sentence_status != "-"
+            else ("-" if gps_block_status in {"", "NONE"} else gps_block_status)
+        )
 
     def _apply_extended_current_log_fields(self, fields: list[str]) -> None:
         self.state.esp32_alive = f"seq {fields[1]} uptime {fields[2]} ms"
@@ -687,6 +713,18 @@ class DashboardWindow(QMainWindow):
         with contextlib.suppress(ValueError):
             return float(value)
         return None
+
+    @staticmethod
+    def _is_full_current_log_fields(fields: list[str]) -> bool:
+        if len(fields) < 31:
+            return False
+        return (
+            DashboardWindow._parse_float(fields[11]) is not None
+            and DashboardWindow._parse_float(fields[12]) is not None
+            and DashboardWindow._parse_float(fields[23]) is not None
+            and DashboardWindow._parse_float(fields[24]) is not None
+            and DashboardWindow._parse_float(fields[25]) is not None
+        )
 
     @staticmethod
     def _is_extended_current_log_fields(fields: list[str]) -> bool:

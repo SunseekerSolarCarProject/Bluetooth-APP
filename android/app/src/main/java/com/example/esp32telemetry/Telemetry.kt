@@ -199,6 +199,7 @@ class TelemetryReducer {
     private fun applyLogLine(state: TelemetryState, line: String) {
         val fields = parseCsv(line)
         when {
+            isFullCurrentLog(fields) -> applyFullCurrentLogFields(state, fields)
             isExtendedCurrentLog(fields) -> applyExtendedCurrentLogFields(state, fields)
             fields.size >= 23 -> applyLegacyLogFields(state, fields)
             fields.size >= 21 -> applyCurrentLogFields(state, fields)
@@ -217,6 +218,23 @@ class TelemetryReducer {
         state.lastCanData = "${fields[17]},${fields[18]}"
         state.latestGpsSentence = fields[20]
         state.gpsStatus = gpsStatusFromSentence(fields[20])
+    }
+
+    private fun applyFullCurrentLogFields(state: TelemetryState, fields: List<String>) {
+        state.esp32Status = "seq ${fields[1]} uptime ${fields[2]} ms"
+        state.telemetrySource = if (fields[4] == "1") "OK" else fields[4]
+        state.speed = fields[11]
+        state.gpsSpeed = fields[12]
+        state.temperature = fields[23]
+        state.pressure = fields[24]
+        state.humidity = fields[25]
+        state.sdCardStatus = formatSdStatus(fields[26])
+        state.lastCanId = fields[27]
+        state.lastCanData = "${fields[28]},${fields[29]}"
+        state.latestGpsSentence = fields[30]
+        val sentenceStatus = gpsStatusFromSentence(fields[30])
+        val blockStatus = fields[16]
+        state.gpsStatus = if (sentenceStatus != "-") sentenceStatus else if (blockStatus.isBlank() || blockStatus == "NONE") "-" else blockStatus
     }
 
     private fun applyExtendedCurrentLogFields(state: TelemetryState, fields: List<String>) {
@@ -250,6 +268,15 @@ class TelemetryReducer {
         state.lastCanData = "${fields[19]},${fields[20]}"
         state.latestGpsSentence = fields[22]
         state.gpsStatus = gpsStatusFromSentence(fields[22])
+    }
+
+    private fun isFullCurrentLog(fields: List<String>): Boolean {
+        return fields.size >= 31
+            && fields[11].toDoubleOrNull() != null
+            && fields[12].toDoubleOrNull() != null
+            && fields[23].toDoubleOrNull() != null
+            && fields[24].toDoubleOrNull() != null
+            && fields[25].toDoubleOrNull() != null
     }
 
     private fun isExtendedCurrentLog(fields: List<String>): Boolean {
