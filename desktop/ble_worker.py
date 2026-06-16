@@ -1,6 +1,8 @@
 import asyncio
 import concurrent.futures
 import contextlib
+import os
+import platform
 import queue
 import threading
 from typing import Any
@@ -76,11 +78,48 @@ class BleWorker:
 
     async def _scan(self, timeout: float) -> None:
         self.events.put(("status", "Scanning for BLE devices..."))
-        devices = await BleakScanner.discover(timeout=timeout)
+        try:
+            devices = await BleakScanner.discover(timeout=timeout)
+        except Exception as exc:
+            raise RuntimeError(self._scan_error_message(exc)) from exc
         devices = [device for device in devices if device.name or device.address]
         devices.sort(key=lambda device: ((device.name or "Unknown").casefold(), device.address))
         self.events.put(("devices", devices))
         self.events.put(("status", f"Found {len(devices)} BLE device(s)."))
+
+    def _scan_error_message(self, exc: Exception) -> str:
+        detail = str(exc)
+        if platform.system() == "Linux" and (
+            "org.freedesktop.DBus.Error.ServiceUnknown" in detail
+            or "org.bluez" in detail
+        ):
+            flatpak_id = os.environ.get("FLATPAK_ID")
+            if flatpak_id or self._looks_like_flatpak_environment():
+                app_id = flatpak_id or "the Flatpak app"
+                return (
+                    "Bluetooth is running on the host, but this app is running inside "
+                    f"a Flatpak sandbox ({app_id}) that cannot see org.bluez on DBus. "
+                    "Run the app from a normal host terminal, install a non-Flatpak VS Code, "
+                    "or allow the sandbox to talk to BlueZ: "
+                    f"flatpak override --user --system-talk-name=org.bluez {app_id}. "
+                    "Restart the sandboxed app after changing permissions. "
+                    f"Details: {detail}"
+                )
+            return (
+                "Linux Bluetooth DBus service org.bluez is not running or visible. "
+                "Start Bluetooth, then retry the scan: sudo systemctl start bluetooth. "
+                "If it still fails, check: systemctl status bluetooth and bluetoothctl show. "
+                f"Details: {detail}"
+            )
+        return detail
+
+    @staticmethod
+    def _looks_like_flatpak_environment() -> bool:
+        return (
+            os.environ.get("container") == "flatpak"
+            or "/run/flatpak/" in os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+            or "/app/" in os.environ.get("XDG_CONFIG_DIRS", "")
+        )
 
     async def _connect(self, device: BLEDevice) -> None:
         self.device = device

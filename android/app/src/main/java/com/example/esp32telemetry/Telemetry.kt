@@ -15,27 +15,31 @@ data class TelemetryState(
     var gpsStatus: String = "-",
     var gpsSpeed: String = "-",
     var latestGpsSentence: String = "-",
-    var speed: String = "-",
+    var imuSpeed: String = "-",
     var temperature: String = "-",
     var pressure: String = "-",
     var humidity: String = "-",
     var sdCardStatus: String = "-",
-    var telemetrySource: String = "-",
-    var esp32Status: String = "-",
+    var stm32Alive: String = "-",
+    var esp32Alive: String = "-",
     var lastResponse: String = "-",
 ) {
-    fun secondsSinceLastUpdate(): String {
+    fun secondsSinceLastUpdate(now: Long = SystemClock.elapsedRealtime()): String {
         val last = lastUpdateElapsed ?: return "-"
-        return "%.1fs".format((SystemClock.elapsedRealtime() - last) / 1000.0)
+        return "%.1fs".format(((now - last) / 1000.0).coerceAtLeast(0.0))
     }
 }
 
 class TelemetryParser {
     private val prefixes = listOf("\$LOG,", "TEL,", "STATUS,")
     private var buffer = ""
+    private var lastBufferUpdate = 0L
+    private val stalePartialMs = 1500L
 
     fun feed(data: ByteArray): List<String> {
+        val now = SystemClock.elapsedRealtime()
         buffer += data.toString(Charsets.UTF_8)
+        lastBufferUpdate = now
         val lines = mutableListOf<String>()
 
         while (buffer.contains('\n') || buffer.contains('\r')) {
@@ -52,6 +56,9 @@ class TelemetryParser {
         val extracted = extractRecords(buffer)
         lines += extracted.first
         buffer = extracted.second
+        if (lines.isNotEmpty() && buffer.isNotEmpty()) {
+            lastBufferUpdate = now
+        }
 
         if (buffer.length > 4096 && recordStarts(buffer).isEmpty()) {
             lines += buffer.trim()
@@ -59,6 +66,16 @@ class TelemetryParser {
         }
 
         return lines
+    }
+
+    fun flushStalePartial(): List<String> {
+        if (buffer.isBlank()) return emptyList()
+        val elapsed = SystemClock.elapsedRealtime() - lastBufferUpdate
+        if (elapsed < stalePartialMs) return emptyList()
+
+        val record = buffer.trim()
+        buffer = ""
+        return listOf(record)
     }
 
     private fun splitCompleteRecords(text: String): List<String> {
@@ -84,7 +101,7 @@ class TelemetryParser {
             val end = if (isLast) text.length else starts[index + 1]
             val record = text.substring(start, end).trim()
             if (record.isEmpty()) return@forEachIndexed
-            if (!isLast || forceLast || looksCompleteRecord(record)) {
+            if (!isLast || forceLast) {
                 records += record
             } else {
                 return records to record
@@ -108,58 +125,87 @@ class TelemetryParser {
         return starts
     }
 
-    private fun looksCompleteRecord(record: String): Boolean {
-        if (record.startsWith("TEL,")) {
-            return record.contains(",gps=") || record.contains(",gps_status=")
-        }
-        if (record.startsWith("STATUS,")) {
-            return listOf(",stm_drop=", ",cmd_drop=", ",ble_drop=", ",seq_jumps=", ",last_ble_notify_ms=")
-                .any { record.contains(it) }
-        }
-        if (record.startsWith("\$LOG,")) {
-            return parseCsv(record).size >= 21
-        }
-        return false
-    }
 }
 
 class TelemetryReducer {
     private val timeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
 
-    fun applyLine(state: TelemetryState, line: String) {
-        state.lastUpdateTime = LocalDateTime.now().format(timeFormatter)
-        state.lastUpdateElapsed = SystemClock.elapsedRealtime()
+    fun applyLine(state: TelemetryState, line: String): Boolean {
         state.lastResponse = line
 
         val parts = line.split(",").map { it.trim() }.filter { it.isNotEmpty() }
-        if (parts.isEmpty()) return
+        if (parts.isEmpty()) return false
         val messageType = parts.first().uppercase()
         val pairs = parsePairs(parts.drop(1))
+        var updatedTelemetry = true
 
         when (messageType) {
-            "TEL" -> applyTelPairs(state, pairs)
-            "STATUS" -> applyStatusPairs(state, pairs)
-            "\$LOG" -> applyLogLine(state, line)
+            "PONG" -> {
+                state.esp32Alive = pairs["esp32_ms"] ?: pairs["ms"] ?: "alive"
+                updatedTelemetry = false
+            }
+            "ACK" -> {
+                state.lastResponse = line
+                updatedTelemetry = false
+            }
+            "TEL" -> {
+                applyTelPairs(state, pairs)
+                updatedTelemetry = pairs.isNotEmpty()
+            }
+            "STATUS" -> {
+                applyStatusPairs(state, pairs)
+                updatedTelemetry = pairs.isNotEmpty()
+            }
+            "\$LOG" -> updatedTelemetry = applyLogLine(state, line)
+            "CAN" -> {
+                state.canRxCount += 1
+                state.lastCanId = pairs["id"] ?: pairs["can_id"] ?: state.lastCanId
+                state.lastCanData = pairs["data"] ?: state.lastCanData
+            }
             "GPS" -> {
                 state.gpsStatus = pairs["status"] ?: pairs["gps"] ?: state.gpsStatus
                 state.gpsSpeed = pairs["gps_speed"] ?: pairs["gps_speed_kph"] ?: pairs["gps_kph"] ?: pairs["speed"] ?: state.gpsSpeed
                 state.latestGpsSentence = pairs["sentence"] ?: pairs["nmea"] ?: state.latestGpsSentence
             }
+            "IMU" -> {
+                state.imuSpeed = pairs["speed"] ?: pairs["imu_speed"] ?: state.imuSpeed
+            }
             "ENV", "BME", "TEMP" -> applyEnvironmentPairs(state, pairs)
-            else -> applyStatusPairs(state, pairs)
+            "SD" -> {
+                state.sdCardStatus = pairs["status"] ?: pairs["sd"] ?: line
+            }
+            "STM32" -> {
+                state.stm32Alive = pairs["alive"] ?: pairs["ms"] ?: "alive"
+            }
+            "ESP32" -> {
+                state.esp32Alive = pairs["alive"] ?: pairs["ms"] ?: "alive"
+            }
+            else -> {
+                if (pairs.isEmpty()) {
+                    updatedTelemetry = false
+                } else {
+                    applyStatusPairs(state, pairs)
+                }
+            }
         }
+
+        if (updatedTelemetry) {
+            state.lastUpdateTime = LocalDateTime.now().format(timeFormatter)
+            state.lastUpdateElapsed = SystemClock.elapsedRealtime()
+        }
+        return updatedTelemetry
     }
 
     private fun applyTelPairs(state: TelemetryState, pairs: Map<String, String>) {
-        pairs["seq"]?.let { state.esp32Status = "seq $it" }
-        pairs["age_ms"]?.let { state.telemetrySource = "age $it ms" }
+        pairs["seq"]?.let { state.esp32Alive = "seq $it" }
+        pairs["age_ms"]?.let { state.stm32Alive = "age $it ms" }
 
         if (applyShiftedCompactFields(state, pairs)) {
             applyTelStatusPairs(state, pairs)
             return
         }
 
-        pairs["speed"]?.let { state.speed = it }
+        pairs["speed"]?.let { state.imuSpeed = it }
         pairs["temp"]?.let { state.temperature = it }
         pairs["temperature"]?.let { state.temperature = it }
         pairs["pressure"]?.let { state.pressure = it }
@@ -177,8 +223,8 @@ class TelemetryReducer {
         if (state.temperature == "-" || state.temperature == state.humidity) {
             state.temperature = "-"
         }
-        if (state.speed == pairs["speed"]) {
-            state.speed = "-"
+        if (state.imuSpeed == pairs["speed"]) {
+            state.imuSpeed = "-"
         }
         return true
     }
@@ -196,20 +242,33 @@ class TelemetryReducer {
         pairs["raw_len"]?.let { state.lastCanData = "${state.lastCanData} raw_len=$it" }
     }
 
-    private fun applyLogLine(state: TelemetryState, line: String) {
+    private fun applyLogLine(state: TelemetryState, line: String): Boolean {
         val fields = parseCsv(line)
-        when {
-            isFullCurrentLog(fields) -> applyFullCurrentLogFields(state, fields)
-            isExtendedCurrentLog(fields) -> applyExtendedCurrentLogFields(state, fields)
-            fields.size >= 23 -> applyLegacyLogFields(state, fields)
-            fields.size >= 21 -> applyCurrentLogFields(state, fields)
+        return when {
+            isFullCurrentLog(fields) -> {
+                applyFullCurrentLogFields(state, fields)
+                true
+            }
+            isExtendedCurrentLog(fields) -> {
+                applyExtendedCurrentLogFields(state, fields)
+                true
+            }
+            fields.size >= 23 -> {
+                applyLegacyLogFields(state, fields)
+                true
+            }
+            fields.size >= 21 -> {
+                applyCurrentLogFields(state, fields)
+                true
+            }
+            else -> false
         }
     }
 
     private fun applyCurrentLogFields(state: TelemetryState, fields: List<String>) {
-        state.esp32Status = "seq ${fields[1]} uptime ${fields[2]} ms"
-        state.telemetrySource = if (fields[4] == "1") "OK" else fields[4]
-        state.speed = fields[11]
+        state.esp32Alive = "seq ${fields[1]} uptime ${fields[2]} ms"
+        state.stm32Alive = if (fields[4] == "1") "OK" else fields[4]
+        state.imuSpeed = fields[11]
         state.temperature = fields[12]
         state.pressure = fields[13]
         state.humidity = fields[14]
@@ -221,9 +280,9 @@ class TelemetryReducer {
     }
 
     private fun applyFullCurrentLogFields(state: TelemetryState, fields: List<String>) {
-        state.esp32Status = "seq ${fields[1]} uptime ${fields[2]} ms"
-        state.telemetrySource = if (fields[4] == "1") "OK" else fields[4]
-        state.speed = fields[11]
+        state.esp32Alive = "seq ${fields[1]} uptime ${fields[2]} ms"
+        state.stm32Alive = if (fields[4] == "1") "OK" else fields[4]
+        state.imuSpeed = fields[11]
         state.gpsSpeed = fields[12]
         state.temperature = fields[23]
         state.pressure = fields[24]
@@ -238,9 +297,9 @@ class TelemetryReducer {
     }
 
     private fun applyExtendedCurrentLogFields(state: TelemetryState, fields: List<String>) {
-        state.esp32Status = "seq ${fields[1]} uptime ${fields[2]} ms"
-        state.telemetrySource = if (fields[4] == "1") "OK" else fields[4]
-        state.speed = fields[11]
+        state.esp32Alive = "seq ${fields[1]} uptime ${fields[2]} ms"
+        state.stm32Alive = if (fields[4] == "1") "OK" else fields[4]
+        state.imuSpeed = fields[11]
         state.gpsSpeed = fields[12]
         state.temperature = fields[16]
         state.pressure = fields[17]
@@ -255,11 +314,11 @@ class TelemetryReducer {
     }
 
     private fun applyLegacyLogFields(state: TelemetryState, fields: List<String>) {
-        state.esp32Status = "uptime ${fields[2]} ms"
-        state.telemetrySource = if (fields[4] == "1") "OK" else fields[4]
-        if (fields[6] == "1") state.esp32Status = "OK"
+        state.esp32Alive = "uptime ${fields[2]} ms"
+        state.stm32Alive = if (fields[4] == "1") "OK" else fields[4]
+        if (fields[6] == "1") state.esp32Alive = "OK"
         state.canRxCount = fields[8].toIntOrNull() ?: state.canRxCount
-        state.speed = fields[13]
+        state.imuSpeed = fields[13]
         state.temperature = fields[14]
         state.pressure = fields[15]
         state.humidity = fields[16]
@@ -292,7 +351,7 @@ class TelemetryReducer {
         pairs["stm32"]?.let { sourceParts += "src=$it" }
         pairs["spi_task"]?.let { sourceParts += "spi=$it" }
         pairs["age_ms"]?.let { sourceParts += "age=$it ms" }
-        if (sourceParts.isNotEmpty()) state.telemetrySource = sourceParts.joinToString(" ")
+        if (sourceParts.isNotEmpty()) state.stm32Alive = sourceParts.joinToString(" ")
 
         val esp32Parts = mutableListOf<String>()
         pairs["esp32"]?.let { esp32Parts += "esp32=$it" }
@@ -300,7 +359,7 @@ class TelemetryReducer {
         pairs["seq"]?.let { esp32Parts += "seq=$it" }
         pairs["mode"]?.let { esp32Parts += "mode=$it" }
         pairs["rate_ms"]?.let { esp32Parts += "rate=$it ms" }
-        if (esp32Parts.isNotEmpty()) state.esp32Status = esp32Parts.joinToString(" ")
+        if (esp32Parts.isNotEmpty()) state.esp32Alive = esp32Parts.joinToString(" ")
 
         pairs["can"]?.let { state.lastCanData = "CAN $it" }
         pairs["sd"]?.let { state.sdCardStatus = it }

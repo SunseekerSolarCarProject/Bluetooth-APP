@@ -2,7 +2,9 @@ package com.example.esp32telemetry
 
 import android.Manifest
 import android.app.Activity
-import android.bluetooth.BluetoothDevice
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -10,16 +12,38 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.view.WindowInsets
 import android.widget.Button
 import android.widget.EditText
 import android.widget.GridLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.io.ByteArrayOutputStream
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 
 class MainActivity : Activity(), BleTelemetryClient.Listener {
+    private enum class AppTab(val label: String) {
+        Connection("Connect"),
+        Telemetry("Telemetry"),
+        Commands("Commands"),
+        Log("Log"),
+    }
+
+    private data class UiColors(
+        val background: Int,
+        val surface: Int,
+        val surfaceStrong: Int,
+        val text: Int,
+        val muted: Int,
+        val accent: Int,
+        val accentText: Int,
+        val border: Int,
+    )
+
     private lateinit var bleClient: BleTelemetryClient
     private val parser = TelemetryParser()
     private val reducer = TelemetryReducer()
@@ -27,27 +51,39 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
     private val devices = linkedMapOf<String, BleDeviceInfo>()
     private val fieldViews = mutableMapOf<String, TextView>()
     private val rawEntries = ArrayDeque<Pair<Long, String>>()
+    private val pendingBleChunks = ArrayDeque<ByteArray>()
+    private val pendingBleLock = Any()
     private val rawRetentionMs = 5 * 60 * 1000L
+    private val fieldRefreshMs = 100L
     private val timestampFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
     private val rtcFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd,HH:mm:ss")
     private val uiHandler = Handler(Looper.getMainLooper())
     private val refreshTick = object : Runnable {
         override fun run() {
+            applyParsedLines(parser.flushStalePartial())
             refreshFields()
-            uiHandler.postDelayed(this, 1000)
+            uiHandler.postDelayed(this, fieldRefreshMs)
         }
     }
 
+    private lateinit var root: LinearLayout
     private lateinit var statusView: TextView
+    private lateinit var tabRow: LinearLayout
+    private lateinit var contentHost: LinearLayout
     private lateinit var deviceList: LinearLayout
     private lateinit var commandEntry: EditText
     private lateinit var rawLog: TextView
     private lateinit var disconnectButton: Button
-    private lateinit var commandButtons: List<Button>
-    private lateinit var writeDependentViews: List<View>
+    private var commandButtons: List<Button> = emptyList()
+    private var writeDependentViews: List<View> = emptyList()
+    private var activeTab = AppTab.Connection
+    private var darkMode = false
+    private var activeCanWrite = false
+    private var bleDrainPosted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        darkMode = getPreferences(MODE_PRIVATE).getBoolean("dark_mode", false)
         bleClient = BleTelemetryClient(this, this)
         buildUi()
         requestBlePermissions()
@@ -62,18 +98,96 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
     }
 
     private fun buildUi() {
-        val root = LinearLayout(this).apply {
+        val colors = colors()
+        applySystemBars(colors)
+        fieldViews.clear()
+
+        root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(24, 24, 24, 24)
+            setBackgroundColor(colors.background)
+            setPadding(dp(16), topInset() + dp(12), dp(16), dp(12))
         }
 
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         statusView = TextView(this).apply {
-            text = "Disconnected"
+            text = if (state.connected) "Connected to ${state.deviceName}" else "Disconnected"
             textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colors.text)
+            maxLines = 2
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        root.addView(statusView)
+        val themeButton = Button(this).apply {
+            text = if (darkMode) "Light" else "Dark"
+            setOnClickListener {
+                darkMode = !darkMode
+                getPreferences(MODE_PRIVATE).edit().putBoolean("dark_mode", darkMode).apply()
+                buildUi()
+                refreshFields()
+            }
+        }
+        styleButton(themeButton, colors, filled = false)
+        header.addView(statusView)
+        header.addView(themeButton, fixedButtonParams())
+        root.addView(header)
 
-        val topControls = LinearLayout(this).apply {
+        tabRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, dp(8))
+        }
+        AppTab.entries.forEach { tab ->
+            val button = Button(this).apply {
+                text = tab.label
+                setOnClickListener {
+                    activeTab = tab
+                    renderCurrentTab()
+                }
+            }
+            tabRow.addView(button, LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                marginEnd = dp(6)
+            })
+        }
+        root.addView(tabRow)
+
+        contentHost = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f,
+            )
+        }
+        root.addView(contentHost)
+        setContentView(root)
+        renderCurrentTab()
+    }
+
+    private fun renderCurrentTab() {
+        val colors = colors()
+        for (index in 0 until tabRow.childCount) {
+            val button = tabRow.getChildAt(index) as Button
+            styleButton(button, colors, filled = AppTab.entries[index] == activeTab)
+        }
+
+        contentHost.removeAllViews()
+        when (activeTab) {
+            AppTab.Connection -> renderConnectionTab(colors)
+            AppTab.Telemetry -> renderTelemetryTab(colors)
+            AppTab.Commands -> renderCommandsTab(colors)
+            AppTab.Log -> renderLogTab(colors)
+        }
+        setConnectedControls(state.connected, activeCanWrite)
+        refreshFields()
+    }
+
+    private fun renderConnectionTab(colors: UiColors) {
+        val body = verticalBody(colors)
+
+        val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
@@ -81,7 +195,7 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
             text = "Scan"
             setOnClickListener {
                 devices.clear()
-                deviceList.removeAllViews()
+                renderDeviceButtons(colors)
                 bleClient.scan()
             }
         }
@@ -89,19 +203,23 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
             text = "Disconnect"
             setOnClickListener { bleClient.disconnect() }
         }
-        topControls.addView(scanButton)
-        topControls.addView(disconnectButton)
-        root.addView(topControls)
+        styleButton(scanButton, colors, filled = true)
+        styleButton(disconnectButton, colors, filled = false)
+        controls.addView(scanButton, fixedButtonParams())
+        controls.addView(disconnectButton, fixedButtonParams())
+        body.addView(controls)
 
+        body.addView(sectionLabel("Devices", colors))
         deviceList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        root.addView(deviceList)
+        body.addView(deviceList)
+        renderDeviceButtons(colors)
+        contentHost.addView(scroll(body))
+    }
 
-        val dashboard = GridLayout(this).apply {
-            columnCount = 2
-            useDefaultMargins = true
-        }
+    private fun renderTelemetryTab(colors: UiColors) {
+        val body = verticalBody(colors)
         val fields = listOf(
             "Connection" to "connection",
             "Last update time" to "last_update_time",
@@ -112,30 +230,44 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
             "GPS status" to "gps_status",
             "GPS speed" to "gps_speed",
             "Latest GPS sentence" to "latest_gps_sentence",
-            "Speed" to "speed",
+            "IMU speed" to "imu_speed",
             "Temperature / pressure / humidity" to "environment",
             "SD card status" to "sd_card_status",
-            "Telemetry source / age" to "telemetry_source",
-            "ESP32 sequence / status" to "esp32_status",
+            "STM32 alive" to "stm32_alive",
+            "ESP32 alive" to "esp32_alive",
             "Last response" to "last_response",
         )
         fields.forEach { (label, key) ->
-            dashboard.addView(TextView(this).apply {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(14), dp(10), dp(14), dp(10))
+                background = rounded(colors.surface, colors.border)
+            }
+            row.addView(TextView(this).apply {
                 text = label
-                setPadding(0, 4, 18, 4)
+                textSize = 13f
+                setTextColor(colors.muted)
             })
             val value = TextView(this).apply {
                 text = "-"
-                setPadding(0, 4, 0, 4)
+                textSize = 16f
+                setTextColor(colors.text)
+                setPadding(0, dp(4), 0, 0)
             }
             fieldViews[key] = value
-            dashboard.addView(value)
+            row.addView(value)
+            body.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                bottomMargin = dp(8)
+            })
         }
-        root.addView(dashboard)
+        contentHost.addView(scroll(body))
+    }
 
-        val commandPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
+    private fun renderCommandsTab(colors: UiColors) {
+        val body = verticalBody(colors)
         val commandGrid = GridLayout(this).apply {
             columnCount = 2
             useDefaultMargins = true
@@ -151,16 +283,25 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
                 setOnClickListener { sendCommand("SET_RTC,${LocalDateTime.now().format(rtcFormatter)}") }
             },
         ))
-        commandButtons.forEach { commandGrid.addView(it) }
-        commandPanel.addView(commandGrid)
+        commandButtons.forEach {
+            styleButton(it, colors, filled = true)
+            commandGrid.addView(it, ViewGroup.LayoutParams(dp(170), dp(52)))
+        }
+        body.addView(HorizontalScrollView(this).apply { addView(commandGrid) })
 
         val customRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(14), 0, 0)
         }
         commandEntry = EditText(this).apply {
             hint = "Custom command"
             setSingleLine(true)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setTextColor(colors.text)
+            setHintTextColor(colors.muted)
+            background = rounded(colors.surface, colors.border)
+            setPadding(dp(12), 0, dp(12), 0)
+            layoutParams = LinearLayout.LayoutParams(0, dp(52), 1f)
         }
         val sendButton = Button(this).apply {
             text = "Send"
@@ -172,27 +313,53 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
                 }
             }
         }
+        styleButton(sendButton, colors, filled = false)
         customRow.addView(commandEntry)
-        customRow.addView(sendButton)
-        commandPanel.addView(customRow)
-        root.addView(commandPanel)
-
-        rawLog = TextView(this).apply {
-            setTextIsSelectable(true)
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        root.addView(ScrollView(this).apply {
-            addView(rawLog)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f,
-            )
-        })
+        customRow.addView(sendButton, fixedButtonParams())
+        body.addView(customRow)
 
         writeDependentViews = commandButtons + listOf(commandEntry, sendButton)
-        setConnectedControls(connected = false, canWrite = false)
-        setContentView(root)
+        contentHost.addView(scroll(body))
+    }
+
+    private fun renderLogTab(colors: UiColors) {
+        rawLog = TextView(this).apply {
+            setTextIsSelectable(true)
+            typeface = Typeface.MONOSPACE
+            textSize = 13f
+            setTextColor(colors.text)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = rounded(colors.surfaceStrong, colors.border)
+            text = rawEntries.joinToString("\n") { it.second }
+        }
+        contentHost.addView(scroll(rawLog))
+    }
+
+    private fun renderDeviceButtons(colors: UiColors = colors()) {
+        if (!::deviceList.isInitialized) return
+        deviceList.removeAllViews()
+        if (devices.isEmpty()) {
+            deviceList.addView(TextView(this).apply {
+                text = "No devices yet. Tap Scan to search."
+                textSize = 15f
+                setTextColor(colors.muted)
+                setPadding(0, dp(8), 0, 0)
+            })
+            return
+        }
+        devices.values.forEach { device ->
+            val button = Button(this).apply {
+                text = "${device.name} [${device.address}]"
+                setOnClickListener { bleClient.connect(device.device) }
+            }
+            styleButton(button, colors, filled = false)
+            deviceList.addView(button, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(54),
+            ).apply {
+                bottomMargin = dp(8)
+            })
+        }
     }
 
     private fun requestBlePermissions() {
@@ -217,10 +384,7 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
     override fun onDeviceFound(device: BleDeviceInfo) = runOnUiThread {
         if (devices.containsKey(device.address)) return@runOnUiThread
         devices[device.address] = device
-        deviceList.addView(Button(this).apply {
-            text = "${device.name} [${device.address}]"
-            setOnClickListener { bleClient.connect(device.device) }
-        })
+        if (activeTab == AppTab.Connection) renderDeviceButtons()
     }
 
     override fun onStatus(message: String) = runOnUiThread {
@@ -234,6 +398,7 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
     override fun onConnected(name: String, address: String, canWrite: Boolean) = runOnUiThread {
         state.connected = true
         state.deviceName = "$name [$address]"
+        activeCanWrite = canWrite
         statusView.text = "Connected to ${state.deviceName}"
         appendRaw("! connected to ${state.deviceName}")
         if (!canWrite) appendRaw("! no writable characteristic found; receive-only mode")
@@ -243,17 +408,35 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
 
     override fun onDisconnected(expected: Boolean) = runOnUiThread {
         state.connected = false
+        activeCanWrite = false
         statusView.text = if (expected) "Disconnected" else "Disconnected - reconnecting"
         appendRaw(if (expected) "! disconnected" else "! disconnected unexpectedly")
         setConnectedControls(connected = false, canWrite = false)
         refreshFields()
     }
 
-    override fun onData(data: ByteArray) = runOnUiThread {
-        parser.feed(data).forEach { line ->
-            appendRaw(line)
-            reducer.applyLine(state, line)
+    override fun onData(data: ByteArray) {
+        synchronized(pendingBleLock) {
+            pendingBleChunks.addLast(data)
+            if (bleDrainPosted) return
+            bleDrainPosted = true
         }
+        uiHandler.postDelayed({ drainBleChunks() }, 25)
+    }
+
+    private fun drainBleChunks() {
+        val chunks = mutableListOf<ByteArray>()
+        synchronized(pendingBleLock) {
+            while (pendingBleChunks.isNotEmpty()) {
+                chunks += pendingBleChunks.removeFirst()
+            }
+            bleDrainPosted = false
+        }
+        if (chunks.isEmpty()) return
+
+        val combined = ByteArrayOutputStream(chunks.sumOf { it.size })
+        chunks.forEach { combined.write(it) }
+        applyParsedLines(parser.feed(combined.toByteArray()))
         refreshFields()
     }
 
@@ -263,31 +446,33 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
 
     override fun onError(message: String) = runOnUiThread {
         appendRaw("! $message")
+        statusView.text = message
     }
 
     private fun setConnectedControls(connected: Boolean, canWrite: Boolean) {
-        disconnectButton.isEnabled = connected
+        if (::disconnectButton.isInitialized) disconnectButton.isEnabled = connected
         writeDependentViews.forEach { it.isEnabled = connected && canWrite }
     }
 
     private fun refreshFields() {
+        val now = SystemClock.elapsedRealtime()
         val connection = if (state.connected) "Connected - ${state.deviceName}" else "Disconnected"
         val environment = "${state.temperature} / ${state.pressure} / ${state.humidity}"
         val values = mapOf(
             "connection" to connection,
             "last_update_time" to state.lastUpdateTime,
-            "seconds_since_last_update" to state.secondsSinceLastUpdate(),
+            "seconds_since_last_update" to state.secondsSinceLastUpdate(now),
             "can_rx_count" to state.canRxCount.toString(),
             "last_can_id" to state.lastCanId,
             "last_can_data" to state.lastCanData,
             "gps_status" to state.gpsStatus,
             "gps_speed" to state.gpsSpeed,
             "latest_gps_sentence" to state.latestGpsSentence,
-            "speed" to state.speed,
+            "imu_speed" to state.imuSpeed,
             "environment" to environment,
             "sd_card_status" to state.sdCardStatus,
-            "telemetry_source" to state.telemetrySource,
-            "esp32_status" to state.esp32Status,
+            "stm32_alive" to state.stm32Alive,
+            "esp32_alive" to state.esp32Alive,
             "last_response" to state.lastResponse,
         )
         values.forEach { (key, value) -> fieldViews[key]?.text = value }
@@ -300,6 +485,110 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
         while (rawEntries.isNotEmpty() && rawEntries.first().first < now - rawRetentionMs) {
             rawEntries.removeFirst()
         }
-        rawLog.text = rawEntries.joinToString("\n") { it.second }
+        if (::rawLog.isInitialized) {
+            rawLog.text = rawEntries.joinToString("\n") { it.second }
+        }
     }
+
+    private fun applyParsedLines(lines: List<String>) {
+        lines.forEach { line ->
+            appendRaw(line)
+            reducer.applyLine(state, line)
+        }
+    }
+
+    private fun verticalBody(colors: UiColors) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setBackgroundColor(colors.background)
+    }
+
+    private fun scroll(child: View) = ScrollView(this).apply {
+        addView(child)
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.MATCH_PARENT,
+        )
+    }
+
+    private fun sectionLabel(textValue: String, colors: UiColors) = TextView(this).apply {
+        text = textValue
+        textSize = 14f
+        typeface = Typeface.DEFAULT_BOLD
+        setTextColor(colors.muted)
+        setPadding(0, dp(18), 0, dp(6))
+    }
+
+    private fun styleButton(button: Button, colors: UiColors, filled: Boolean) {
+        button.textSize = 14f
+        button.isAllCaps = false
+        button.setTextColor(if (filled) colors.accentText else colors.text)
+        button.background = rounded(if (filled) colors.accent else colors.surface, colors.border)
+        button.minHeight = 0
+        button.minWidth = 0
+    }
+
+    private fun rounded(fill: Int, stroke: Int) = GradientDrawable().apply {
+        cornerRadius = dp(8).toFloat()
+        setColor(fill)
+        setStroke(dp(1), stroke)
+    }
+
+    private fun fixedButtonParams() = LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.WRAP_CONTENT,
+        dp(44),
+    ).apply {
+        marginStart = dp(8)
+    }
+
+    private fun colors() = if (darkMode) {
+        UiColors(
+            background = Color.rgb(18, 21, 24),
+            surface = Color.rgb(36, 40, 44),
+            surfaceStrong = Color.rgb(24, 28, 32),
+            text = Color.rgb(238, 241, 244),
+            muted = Color.rgb(170, 178, 186),
+            accent = Color.rgb(38, 132, 98),
+            accentText = Color.WHITE,
+            border = Color.rgb(62, 70, 76),
+        )
+    } else {
+        UiColors(
+            background = Color.rgb(250, 251, 252),
+            surface = Color.rgb(238, 241, 242),
+            surfaceStrong = Color.WHITE,
+            text = Color.rgb(38, 45, 51),
+            muted = Color.rgb(105, 116, 124),
+            accent = Color.rgb(36, 126, 92),
+            accentText = Color.WHITE,
+            border = Color.rgb(214, 220, 224),
+        )
+    }
+
+    private fun applySystemBars(colors: UiColors) {
+        window.statusBarColor = colors.background
+        window.navigationBarColor = colors.background
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            window.decorView.systemUiVisibility = if (darkMode) {
+                0
+            } else {
+                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+            }
+        }
+    }
+
+    private fun topInset(): Int {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return window.decorView.rootWindowInsets
+                ?.getInsets(WindowInsets.Type.statusBars())
+                ?.top ?: statusBarFallback()
+        }
+        return statusBarFallback()
+    }
+
+    private fun statusBarFallback(): Int {
+        val resourceId = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (resourceId > 0) resources.getDimensionPixelSize(resourceId) else dp(24)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 }

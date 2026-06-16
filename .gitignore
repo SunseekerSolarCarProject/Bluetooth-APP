@@ -1,0 +1,16 @@
+*.jks
+*.keystore
+keystore.properties
+local.properties
+
+.gradle/
+.kotlin/
+build/
+app/build/
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+
+__pycache__/
+*.py[cod]
