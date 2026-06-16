@@ -12,7 +12,6 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowInsets
 import android.widget.Button
 import android.widget.EditText
@@ -105,20 +104,28 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(colors.background)
-            setPadding(dp(16), topInset() + dp(12), dp(16), dp(12))
+            val sidePadding = if (isCompactWidth()) dp(10) else dp(16)
+            setPadding(sidePadding, topInset() + dp(12), sidePadding, dp(12))
         }
 
         val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = if (isVeryCompactWidth()) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+            gravity = if (isVeryCompactWidth()) Gravity.START else Gravity.CENTER_VERTICAL
         }
         statusView = TextView(this).apply {
             text = if (state.connected) "Connected to ${state.deviceName}" else "Disconnected"
-            textSize = 18f
+            textSize = if (isCompactWidth()) 16f else 18f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(colors.text)
-            maxLines = 2
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            maxLines = 3
+            layoutParams = if (isVeryCompactWidth()) {
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
+            } else {
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
         }
         val themeButton = Button(this).apply {
             text = if (darkMode) "Light" else "Dark"
@@ -131,7 +138,7 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
         }
         styleButton(themeButton, colors, filled = false)
         header.addView(statusView)
-        header.addView(themeButton, fixedButtonParams())
+        header.addView(themeButton, headerButtonParams())
         root.addView(header)
 
         tabRow = LinearLayout(this).apply {
@@ -147,11 +154,13 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
                     renderCurrentTab()
                 }
             }
-            tabRow.addView(button, LinearLayout.LayoutParams(0, dp(44), 1f).apply {
-                marginEnd = dp(6)
-            })
+            tabRow.addView(button, tabButtonParams())
         }
-        root.addView(tabRow)
+        root.addView(HorizontalScrollView(this).apply {
+            isFillViewport = true
+            isHorizontalScrollBarEnabled = false
+            addView(tabRow)
+        })
 
         contentHost = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -205,8 +214,8 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
         }
         styleButton(scanButton, colors, filled = true)
         styleButton(disconnectButton, colors, filled = false)
-        controls.addView(scanButton, fixedButtonParams())
-        controls.addView(disconnectButton, fixedButtonParams())
+        controls.addView(scanButton, actionButtonParams(first = true))
+        controls.addView(disconnectButton, actionButtonParams(first = false))
         body.addView(controls)
 
         body.addView(sectionLabel("Devices", colors))
@@ -253,6 +262,7 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
                 textSize = 16f
                 setTextColor(colors.text)
                 setPadding(0, dp(4), 0, 0)
+                setSingleLine(false)
             }
             fieldViews[key] = value
             row.addView(value)
@@ -269,8 +279,12 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
     private fun renderCommandsTab(colors: UiColors) {
         val body = verticalBody(colors)
         val commandGrid = GridLayout(this).apply {
-            columnCount = 2
-            useDefaultMargins = true
+            columnCount = commandColumnCount()
+            useDefaultMargins = false
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
         }
         commandButtons = (defaultCommands.map { spec ->
             Button(this).apply {
@@ -285,13 +299,13 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
         ))
         commandButtons.forEach {
             styleButton(it, colors, filled = true)
-            commandGrid.addView(it, ViewGroup.LayoutParams(dp(170), dp(52)))
+            commandGrid.addView(it, commandButtonParams())
         }
-        body.addView(HorizontalScrollView(this).apply { addView(commandGrid) })
+        body.addView(commandGrid)
 
         val customRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = if (isCompactWidth()) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+            gravity = if (isCompactWidth()) Gravity.CENTER_HORIZONTAL else Gravity.CENTER_VERTICAL
             setPadding(0, dp(14), 0, 0)
         }
         commandEntry = EditText(this).apply {
@@ -301,7 +315,7 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
             setHintTextColor(colors.muted)
             background = rounded(colors.surface, colors.border)
             setPadding(dp(12), 0, dp(12), 0)
-            layoutParams = LinearLayout.LayoutParams(0, dp(52), 1f)
+            layoutParams = commandEntryParams()
         }
         val sendButton = Button(this).apply {
             text = "Send"
@@ -315,7 +329,7 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
         }
         styleButton(sendButton, colors, filled = false)
         customRow.addView(commandEntry)
-        customRow.addView(sendButton, fixedButtonParams())
+        customRow.addView(sendButton, sendButtonParams())
         body.addView(customRow)
 
         writeDependentViews = commandButtons + listOf(commandEntry, sendButton)
@@ -521,6 +535,7 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
     private fun styleButton(button: Button, colors: UiColors, filled: Boolean) {
         button.textSize = 14f
         button.isAllCaps = false
+        button.maxLines = 2
         button.setTextColor(if (filled) colors.accentText else colors.text)
         button.background = rounded(if (filled) colors.accent else colors.surface, colors.border)
         button.minHeight = 0
@@ -533,11 +548,89 @@ class MainActivity : Activity(), BleTelemetryClient.Listener {
         setStroke(dp(1), stroke)
     }
 
-    private fun fixedButtonParams() = LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.WRAP_CONTENT,
+    private fun headerButtonParams() = if (isVeryCompactWidth()) {
+        LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(44),
+        ).apply {
+            topMargin = dp(8)
+        }
+    } else {
+        LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            dp(44),
+        ).apply {
+            marginStart = dp(8)
+        }
+    }
+
+    private fun tabButtonParams() = if (isCompactWidth()) {
+        LinearLayout.LayoutParams(dp(100), dp(44)).apply {
+            marginEnd = dp(6)
+        }
+    } else {
+        LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+            marginEnd = dp(6)
+        }
+    }
+
+    private fun actionButtonParams(first: Boolean) = LinearLayout.LayoutParams(
+        0,
         dp(44),
+        1f,
     ).apply {
-        marginStart = dp(8)
+        if (!first) marginStart = dp(8)
+    }
+
+    private fun commandEntryParams() = if (isCompactWidth()) {
+        LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(52),
+        )
+    } else {
+        LinearLayout.LayoutParams(0, dp(52), 1f)
+    }
+
+    private fun sendButtonParams() = if (isCompactWidth()) {
+        LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(48),
+        ).apply {
+            topMargin = dp(8)
+        }
+    } else {
+        LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            dp(52),
+        ).apply {
+            marginStart = dp(8)
+        }
+    }
+
+    private fun commandButtonParams() = GridLayout.LayoutParams().apply {
+        width = 0
+        height = dp(52)
+        columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+        setMargins(0, 0, dp(8), dp(8))
+    }
+
+    private fun commandColumnCount(): Int {
+        val width = screenWidthDp()
+        return when {
+            width >= 720 -> 3
+            width >= 420 -> 2
+            else -> 1
+        }
+    }
+
+    private fun isVeryCompactWidth() = screenWidthDp() < 360
+
+    private fun isCompactWidth() = screenWidthDp() < 420
+
+    private fun screenWidthDp(): Int {
+        val configurationWidth = resources.configuration.screenWidthDp
+        if (configurationWidth > 0) return configurationWidth
+        return (resources.displayMetrics.widthPixels / resources.displayMetrics.density).toInt()
     }
 
     private fun colors() = if (darkMode) {
